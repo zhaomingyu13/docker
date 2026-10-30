@@ -1,34 +1,124 @@
-docker run \
-    -u root \
-    -it \
-    --name zmy-1022 \
-    --entrypoint /bin/bash \
-    --net=host \
-    --privileged=true \
-    --shm-size=512g \
-    --device=/dev/davinci_manager \
-    --device=/dev/hisi_hdc \
-    --device=/dev/ummu \
-    --device=/dev/uburma \
-    --device=/dev/davinci0 \
-    --device=/dev/davinci1 \
-    --device=/dev/davinci2 \
-    --device=/dev/davinci3 \
-    --device=/dev/davinci4 \
-    --device=/dev/davinci5 \
-    --device=/dev/davinci6 \
-    --device=/dev/davinci7 \
-    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    -v /root/host:/root/host \
-    -v /usr/local/sbin:/usr/local/sbin \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /var/log/npu/:/usr/slog \
-    -v /mnt:/mnt \
-    -v /data:/data \
-    -v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
-    -v /home/:/home/ \
-    -v /etc/hixlep:/etc/hixlep \
-    33736a603638 \
+Qwen3.6 27B TP4 性能测试报告
+DSpark 与原生 MTP    测试日期 2026 年 10 月 20 至 21 日    测试环境 41_20002
+本报告汇总 DSpark 与原生 MTP 两套部署。每套五个场景各测试两轮，完成 384 条正式请求，均成功且零抢占。第一章说明统一复测方法，第二、三章分别保存两套结果。
+第一章 用例构造与测试步骤
+测试配置
+使用 NPU 0～3，共 4 张 Ascend 910B4（32 GB/卡），目标权重为 Qwen3.6-27B-W8A8。共同配置为 TP4、V1、FULL_DECODE_ONLY、max_num_seqs=8、max_model_len=75808、显存利用率0.90；开启 Prefix Caching、Mamba align 和 chunked prefill。
+DSpark：vLLM 0.26.0+empty，vllm-ascend 0.26.0rc1 加 Free9 冻结补丁，FP16，step3660 K8，batch tokens=8320，capture size=72。
+MTP：vLLM 0.30.0+empty，vllm-ascend 0.30.0rc2，BF16，原生 MTP5，batch tokens=32768，capture sizes 至48。
+测试用例
+场景	输入 tokens	输出 tokens	并发	请求数/轮	轮数
+S1  8K + 8K	8,192	固定 8,192	8	64	2
+S2  20K + 300	20,480	固定 300	4	32	2
+S3  GSM8K	固定 64 题	自然结束，上限 2,048	8	64	2
+S4  LongBench	固定 24 题	自然结束，采用各任务官方上限	8	24	2
+S5  20K + 300	20,480	固定 300	1	8	2
+固定长度场景：K=1,024，使用自然文本 token 素材拼接到指定长度，各请求使用独立首 token；设置 ignore_eos=true，保证输出长度。S5 使用 S2 输入文件的前 8 条，均为独立请求。
+GSM8K：从官方 test 集按 seed=42 抽取 64 题，采用零样本解题提示与模型聊天模板，关闭 thinking，最多输出 2,048 tokens。
+LongBench 经典版：6 类各抽 4 题，seed=42。各任务输出上限为 qasper 128、hotpotqa 32、gov_report 512、trec 64、passage_count 32、lcc 64 tokens，采用官方提示。
+关键步骤
+1  固定输入、样本 ID、顺序和 SHA，temperature=0、seed=42。完成编译与 batch 1～8 预热后，每轮再预热并清空 Prefix Cache；这些步骤不计入正式耗时。
+2  正式窗口按并发连续补发，保存 SSE、输出 token IDs 与服务端计数，每秒采样 KV。每套 10 轮、384 条请求独立审计通过，均零抢占；两轮取对应指标的算术平均。
+服务启动与测试
+统一目录：/home/w00498770/qwen3.6_27_test
+服务入口：start_dspark.sh、start_mtp.sh；统一测试入口：run_test.py；详细说明：README.md。以下命令在服务器宿主机按顺序执行，每次更换运行 ID。
+cd /home/w00498770/qwen3.6_27_test
+bash start_dspark.sh dspark-repeat-001
+python3 run_test.py --run-id dspark-repeat-001
+bash start_mtp.sh mtp-repeat-001
+python3 run_test.py --run-id mtp-repeat-001
+启动前核对 NPU 0～3 的占用与归属。测试结束自动清理本次临时容器；固定输入在 data/inputs/，历史结果在 results/，新复测结果在 runs/<run-id>/。
+ 
+第二章 DSpark 测试结果
+下表为两轮均值；并发与请求数均为单轮配置。全部 10 轮零请求失败、零抢占，Prefix Caching 自然命中率均为 0%。
+时延与端到端耗时
+场景	并发 /
+请求数	TTFT
+ms	TPOT
+ms	请求 E2E
+s	场景 E2E
+s	ITL 流式分块
+ms	ITL token 归一化
+ms
+S1  8K + 8K	8 / 64	2311.111	12.805	107.196	915.784	86.033	12.805
+S2  20K + 300	4 / 32	4835.935	43.642	17.885	144.913	168.806	43.642
+S3  GSM8K	8 / 64	747.304	18.021	7.480	68.682	106.468	17.925
+S4  LongBench	8 / 24	6003.061	204.752	14.002	48.517	252.262	74.146
+S5  20K + 300	1 / 8	3059.522	18.330	8.540	68.327	67.661	18.330
+投机解码 缓存与吞吐
+场景	平均接受长度
+含 bonus	草稿接受率
+%	Prefix 命中率
+%	输出吞吐
+tokens/s	每卡 KV 容量
+GiB	KV 使用峰值
+两轮均值	抢占次数
+两轮合计
+S1  8K + 8K	6.7221	71.526%	0.000%	572.707	16.607	51.760%	0
+S2  20K + 300	3.9107	36.383%	0.000%	66.250	16.607	33.821%	0
+S3  GSM8K	5.9629	62.036%	0.000%	351.045	16.607	34.735%	0
+S4  LongBench	3.4609	30.761%	0.000%	53.876	16.607	48.789%	0
+S5  20K + 300	3.7299	34.124%	0.000%	35.125	16.607	8.684%	0
+统计口径
+TTFT 为请求发出至首个 token 分块的时间；TPOT 为首末 token 分块间隔除以输出 tokens−1，再按请求求均值。请求 E2E 截止完整 SSE 结束，不含客户端并发等待；场景 E2E 为该轮全部正式请求的墙钟耗时。
+ITL 流式分块为相邻 token 分块间隔；归一化 ITL 按到达分块的 token 数折算并加权，无法观测分块内部逐 token 时刻。LongBench 混合短答案和长摘要，因此逐请求 TPOT 均值与 token 加权 ITL 不相等。
+平均接受长度=1+接受草稿 tokens/草稿步数（含 bonus）；仅草稿长度为表值减 1。草稿接受率=接受/提出的草稿 tokens；Prefix 命中率=缓存命中/输入 tokens。KV 容量取实际分配的 tensor 字节数；每 rank 均为 2,189 blocks，四个 rank 的逻辑块池不累加。KV 峰值为 1 秒采样值。
+实际平均输出：GSM8K 为 376.70 tokens，两轮均未触及上限；LongBench 为 108.88 tokens，两轮分别有 11/24、10/24 条触及上限。自然结束场景的输出长度可能随轮次变化，后续对比应复用同一冻结数据与统计口径。 
+第三章 原生 MTP 测试结果
+本章新增 2026 年 10 月 21 日 vllm-ascend 0.30.0rc2 结果。经五组参数调优，固定采用 TP4、MTP5、BF16、batch tokens=32768、V1/FULL_DECODE_ONLY，同一配置覆盖五场景和两轮，复用原输入 token IDs 与样本顺序。
+正式测试共384条请求，全部成功、零抢占，原始数据审计通过；Prefix自然命中率均为0%。以下指标为两个有效轮次均值的算术平均，定义与第二章相同。
+时延与端到端耗时
+场景	并发 /
+请求数	TTFT
+ms	TPOT
+ms	请求 E2E
+s	场景 E2E
+s	ITL 流式分块
+ms	ITL token 归一化
+ms
+S1  8K + 8K	8 / 64	2626.533	11.119	93.706	766.726	64.301	11.119
+S2  20K + 300	4 / 32	4741.279	38.608	16.285	130.956	159.944	38.608
+S3  GSM8K	8 / 64	496.883	14.482	5.916	55.856	69.547	14.227
+S4  LongBench	8 / 24	6564.361	245.471	13.265	43.320	227.125	63.396
+S5  20K + 300	1 / 8	3071.620	9.379	5.876	47.019	36.184	9.379
+投机解码 缓存与吞吐
+场景	平均接受长度
+含 bonus	草稿接受率
+%	Prefix 命中率
+%	输出吞吐
+tokens/s	每卡 KV 容量
+GiB	KV 使用峰值
+两轮均值	抢占次数
+两轮合计
+S1  8K + 8K	5.7844	95.689%	0.000%	683.859	16.139	26.757%	0
+S2  20K + 300	4.1778	63.557%	0.000%	73.307	16.139	15.586%	0
+S3  GSM8K	4.9170	78.340%	0.000%	438.756	16.139	13.739%	0
+S4  LongBench	3.6688	53.375%	0.000%	59.107	16.139	24.414%	0
+S5  20K + 300	3.8710	57.419%	0.000%	51.044	16.139	4.009%	0
+MTP 每 rank 实际共享 KV backing 为16.138794 GiB，逻辑池为1111 blocks。多个描述符覆盖同一底层storage，描述符合计64.555176 GiB属于重叠视图；表中物理容量按分配后的Torch storage去重。KV峰值仍按1秒采样。
+MTP5 与 DSpark K8 提出的草稿数不同，含bonus接受长度上限分别为6和9。接受长度与接受率应结合方法、K值和完整吞吐一起解读。LongBench混合短答案和长摘要，其逐请求TPOT与token加权ITL存在明显差异。
+调优与版本对照
+调优子集为 S5 C1/N4、S2 C4/N8、S1 C8/N8，各测一轮。先比较MTP1/3/5，再比较选中K值下的batch预算。按三个子集耗时相对MTP3/B16384的几何均值选取最低实测值；五组均完整、零抢占并通过审计。这是有限搜索。
+MTP步数	batch tokens	S5 子集耗时
+s	S2 子集耗时
+s	S1 子集耗时
+s	耗时几何比
+3	16384	26.245	33.094	118.892	1.0000
+1	16384	32.924	36.106	197.385	1.3147
+5	16384	24.083	33.756	93.566	0.9031
+5	8320	24.803	32.224	96.700	0.9079
+5	32768	24.436	32.663	94.142	0.8994
+版本差异与 MTP 尾延迟
+P95列为MTP各轮逐请求分布。变化=(MTP/DSpark−1)，时延正值表示变慢，吞吐正值表示提高；波动=(MTP两轮最大值−最小值)/两轮均值。版本、推理方法、FP16/BF16及batch预算同时改变，差异不能归因于单一优化。
+场景	MTP TTFT P95 R1/R2
+ms	MTP TPOT P95 R1/R2
+ms	TTFT变化	TPOT变化	吞吐变化	MTP场景耗时
+波动
+S1  8K + 8K	9712.739/9516.024	12.349/12.272	+13.6%	-13.2%	+19.4%	1.854%
+S2  20K + 300	11439.706/11431.628	56.936/57.130	-2.0%	-11.5%	+10.7%	0.346%
+S3  GSM8K	988.914/902.474	17.298/18.312	-33.5%	-19.6%	+25.0%	16.221%
+S4  LongBench	14658.269/14656.673	1086.348/1086.431	+9.4%	+19.9%	+9.7%	0.144%
+S5  20K + 300	3115.309/3221.483	10.589/10.630	+0.4%	-48.8%	+45.3%	0.480%
+8K+8K输出吞吐由572.707提高至683.859 tokens/s，增幅19.4%；该场景TTFT上升13.6%。LongBench的TPOT由204.752上升至245.471 ms，该项时延退化19.9%。
+两轮输出token IDs一致数：S1为0/64、S2为1/32、S3为8/64、S4为15/24、S5为8/8。自然结束场景的实际输出存在变化：GSM8K平均376.70→382.05 tokens，截顶数0/0→2/0；LongBench平均108.88→106.69 tokens，截顶数11/10→10/10。本次未计算准确率。
+归档证据：/home/w00498770/qwen3.6_27_test/results/dspark-20261020、results/mtp-20261021；各含aggregate.json、raw-audit.json与完整SSE。版本与实际启动命令见configs/dspark.json、configs/mtp.json，调优原始记录见results/tuning/。
